@@ -321,6 +321,16 @@ void dm_fps_state_apply(void) {
     const char *rs = getenv("DM_RENDER_SCALE"); float sc = 1.0f;
     if (rs) { char *end; sc = strtof(rs, &end); if (end == rs || *end || !(sc >= 0.5f && sc <= 1.0f)) { LOG("[RED] DM_RENDER_SCALE=%s: must be 0.5 to 1.0; keeping the game's size", rs); sc = 1.0f; } else LOG("%s: 3D views rendered at %.2f of the game's size (DM_RENDER_SCALE)", g_fps_mod, sc); }
     memcpy(dm_fps_state + 0x10, &sc, sizeof sc);
+    // Render size, for builds whose stub reads it (the RENDER_SIZE capability: Hades II 1.0.131248's app init, Ocarina of Time v131072 docked): DM_RENDER_SIZE=<w>x<h>, 16:9 from 1280x720 to 3840x2160, sets the
+    // game's own swapchain and screen-sized targets; unset or 0 keeps the game's size. Builds without such a stub ignore the field
+    const char *rz = getenv("DM_RENDER_SIZE"); uint32_t wh[2] = {0, 0};
+    if (rz && strcmp(rz, "0")) {
+        unsigned w = 0, h = 0; char tail = 0;
+        if (sscanf(rz, "%ux%u%c", &w, &h, &tail) != 2 || w * 9 != h * 16 || w < 1280 || w > 3840)
+            LOG("[RED] DM_RENDER_SIZE=%s: must be <width>x<height>, 16:9, from 1280x720 to 3840x2160; keeping the game's size", rz);
+        else { wh[0] = w; wh[1] = h; LOG("%s: render size %ux%u (DM_RENDER_SIZE)", g_fps_mod, w, h); }
+    }
+    memcpy(dm_fps_state + 0x38, wh, sizeof wh);
     // The game's own dynamic resolution, for builds whose stubs read it (the DYNAMIC_RESOLUTION capability of a frame step stub: Ocarina of Time's level function): 1 lets it
     // run, 0 (the default) holds full resolution. Builds without such a stub ignore the field
     const char *dr = getenv("DM_DYNAMIC_RESOLUTION"); uint32_t dyn = dr && !strcmp(dr, "1");
