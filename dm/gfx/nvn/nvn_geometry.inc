@@ -682,6 +682,20 @@ static void mtk_encode(id<MTLRenderCommandEncoder> en_) {
 // GPU (and the object blocks of a mesh shader with no task, mtk_encode), before the render pass and for every such draw up to the next write, and the task or object function reads
 // {count, first} from the record itself. Reading the record on the CPU instead took a wait for the GPU at each hazard:
 // 73 % of the submit thread in Ocarina of Time's Kokiri Forest, frames of 90 ms and more against 25 ms of GPU work
+// Task isolation (DM_NVN_ISOLATE_TASK: unset = the default list, 0 = off, 1 = the default list, <keys> = those task shaders). On Apple silicon the draws of Ocarina of Time's
+// Hi-Z task a5288d0a6c4971fd (with its mesh 3439aaa071d868ae: cliffs and giant trunks) and foliage task a7f22b4a795ff4d1 hang the GPU now and then after an area change (fw_ta_state 1, the tiler) when they share a command
+// buffer with the rest of the pass; macOS revokes the GPU after 2 to 5 such hangs. Each such draw is put in a command buffer of its own: the pass ends and the segment is committed
+// right before and right after it (sub_cut, forced as a buffer -> texture copy forces it).
+static const char *isolate_keys(void) {
+    static const char *k; static int done;
+    if (!done) { done = 1; const char *e = getenv("DM_NVN_ISOLATE_TASK");
+        k = !e || !strcmp(e, "1") ? "a5288d0a6c4971fd,a7f22b4a795ff4d1" : !strcmp(e, "0") || !*e ? NULL : e;
+        if (k) MLOG("task isolation: draws of task %s go in command buffers of their own (DM_NVN_ISOLATE_TASK=0 turns it off)", k); else MLOG("task isolation off (DM_NVN_ISOLATE_TASK=0)"); }
+    return k;
+}
+static uint64_t g_iso_draws, g_iso_cuts;
+static void isolate_cut(void) { if (defer_has_active()) defer_fallback(); lc_land(); rp_flush(); rp_end(); ubd_land(); uint32_t s0 = g_seg; g_cut_copy = 1; sub_cut(); g_iso_cuts += g_seg != s0; }
+
 static void mesh_tasks_draw(const p_draw *dw) {
     if (!S.prog || (!dw->ind && dw->count <= 0)) return;
     // Diagnostic DM_NVN_SKIP_MESH=1 (off by default): drops every task / mesh draw, as DM_NVN_SKIP_FS drops draws by fragment shader, to measure what they cost in all (the picture is wrong)
@@ -701,12 +715,16 @@ static void mesh_tasks_draw(const p_draw *dw) {
         if (!mdx_find(dw->ind, dw->ind, &ind)) { mdx_run(dw, NULL); if (!mdx_find(dw->ind, dw->ind, &ind)) ind = 0; }
         if (!ind || !mtl_gpu_addr(dw->ind, 8, &mb, &mo, &ind_rec)) { RED_ONCE(154, "DrawMeshTasksIndirect record at %#llx is in no memory pool: draw skipped", (unsigned long long)dw->ind); return; }
     }
+    const char *iso_k = isolate_keys(); char k16[17] = {0}; if (ts && iso_k && strlen(ts->key) >= 16) memcpy(k16, ts->key, 16);
+    int iso = k16[0] && strstr(iso_k, k16) != NULL;
+    if (iso) { isolate_cut(); if (!(g_iso_draws++ % 20000)) MLOG("task isolation: %llu draws isolated, %llu cuts taken before them", (unsigned long long)g_iso_draws, (unsigned long long)g_iso_cuts); }
     g_mtk.on = 1; g_mtk.miss = 0; g_mtk.ts = ts; g_mtk.ms = ms; g_mtk.first = (uint32_t)dw->first; g_mtk.count = (uint32_t)dw->count;
     g_mtk.ind = ind; g_mtk.ind_rec = ind_rec;
     g_geo_program = raster;
     p_draw triangle = {.prim = 4, .count = 3, .instances = 1};
     draw_(&triangle, NULL);
     g_geo_program = nil; g_mtk.on = 0; args_dirty_all();
+    if (iso) isolate_cut();
     if (g_mtk.miss) { g_mtk_wait++; return; }
     swrite_note(pr); g_wr_epoch++;
     if (!g_mtk_n++) MLOG("task / mesh: first draw, task %s mesh %s fragment %s, %u workgroups from %u%s", ts ? ts->key : "-", ms->key, pr->sh[1] ? pr->sh[1]->key : "-", g_mtk.count, g_mtk.first, ind ? " (indirect)" : "");
