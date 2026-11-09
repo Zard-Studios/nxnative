@@ -1540,7 +1540,7 @@ static inline id<MTL4RenderCommandEncoder> enc_r_begin_pass(MTL4RenderPassDescri
 }
 static inline void enc_r_end_pass(id e) {
     if (!barrier_game() || g_image_heap_n) { m4_end(e); return; }
-    gp_end(e); [(id<MTL4CommandEncoder>)e barrierAfterStages:MTLStageVertex | MTLStageMesh | MTLStageFragment beforeQueueStages:MTLStageFragment | MTLStageDispatch | MTLStageBlit visibilityOptions:resource_vis()];
+    gp_end(e); [(id<MTL4CommandEncoder>)e barrierAfterStages:MTLStageVertex | MTLStageObject | MTLStageMesh | MTLStageFragment beforeQueueStages:MTLStageObject | MTLStageMesh | MTLStageFragment | MTLStageDispatch | MTLStageBlit visibilityOptions:resource_vis()];
     [e endEncoding]; g_last_end_relaxed = 1;
 }
 static inline id<MTL4RenderCommandEncoder> enc_r_begin(MTL4RenderPassDescriptor *d) { g_cm_enc++; cm_enc_mark(2); id<MTL4RenderCommandEncoder> e = [g_cb renderCommandEncoderWithDescriptor:d]; cm_enc_mark(0); [e barrierAfterQueueStages:MTLStageAll beforeStages:MTLStageAll visibilityOptions:resource_vis()]; [e setArgumentTable:g_vt atStages:MTLRenderStageVertex]; [e setArgumentTable:g_ft atStages:MTLRenderStageFragment]; gp_begin(e, 'R', d); return e; }
@@ -3850,7 +3850,7 @@ static void cpu_tex_drop_pool(const void *pool) {
 // part of one cuts it, and the parts outside keep their own stamp, so a CPU write there since stays seen (merging them made the whole merged span the GPU's again). Storage the CPU
 // cannot write (a CPU_NO_ACCESS or virtual pool) has no span: tex_cpu_content takes no texture there, and most render targets lie there. GPU writes are stamped when recorded, so a
 // command buffer submitted again does not stamp its writes again (open: storage the CPU wrote since counts as the CPU's until the next recorded GPU write there)
-typedef struct { uintptr_t lo, hi, page_lo, page_hi; uint64_t stamp, seen; const void *rg; int taken; } gws_span;   // seen: dirty generation at the last look; rg: the dirty-page range holding its whole pages
+typedef struct { uintptr_t lo, hi; uint64_t stamp, seen; const void *rg; int taken; } gws_span;   // seen: dirty generation at the last look; rg: the dirty-page range holding its whole pages
                                                                                                  // (NULL: none, or untracked); taken: tex_cpu_content took a texture over it since its stamp
 static gws_span *g_gws; static size_t g_ngws, g_cgws; static pthread_mutex_t g_gws_mu = PTHREAD_MUTEX_INITIALIZER;
 static _Atomic int g_gws_new;   // the GPU wrote storage anew, or wrote storage a texture was taken from, since cpu_unc_drop last looked
@@ -3871,28 +3871,20 @@ static size_t gws_find(uintptr_t a) {   // the first span that ends after a; g_g
     }
     return l;
 }
-static void gws_reprotect(gws_span *s) {   // preserve a split span's original protected pages
-    s->stamp = s->seen = nvn_dirty_now();
-    s->rg = s->page_hi > s->page_lo ? nvn_dirty_span((const void *)s->page_lo, s->page_hi - s->page_lo) : NULL;
-    if (s->rg) {
-        nvn_dirty_protect((const void *)s->page_lo, s->page_hi - s->page_lo);
-    }
-}
 static void gws_stamp(gws_span *s) {   // the stamp first, then the protection (nvn_dirty_now); g_gws_mu held
-    whole_pages(s->lo, s->hi, &s->page_lo, &s->page_hi);
-    gws_reprotect(s);
+    uintptr_t a, e;
+    whole_pages(s->lo, s->hi, &a, &e);
+    s->stamp = s->seen = nvn_dirty_now();
+    s->rg = e > a ? nvn_dirty_span((const void *)a, e - a) : NULL;
+    if (s->rg) {
+        nvn_dirty_protect((const void *)a, e - a);
+    }
 }
 // The CPU wrote a whole page of [lo, hi) within the span after its stamp; g_gws_mu held. Through the span's kept range: a scan of every registered pool per look would be on the
 // recording thread, at every render target, clear and copy, whenever any page anywhere was written
 static int gws_cpu_since(gws_span *s, uintptr_t lo, uintptr_t hi) {
     uintptr_t a, e;
-    // A split can leave less than one page of an originally protected span.
-    // Keep that page's write history, but only when the queried texture covers
-    // the whole page: writes to a neighbouring texture still do not count.
-    uintptr_t pg = (uintptr_t)getpagesize();
-    whole_pages(lo, hi, &a, &e);
-    a = MAX(a, MAX(s->page_lo, s->lo & ~(pg - 1)));
-    e = MIN(e, MIN(s->page_hi, (s->hi + pg - 1) & ~(pg - 1)));
+    whole_pages(MAX(lo, s->lo), MIN(hi, s->hi), &a, &e);
     if (e <= a || !s->rg) {
         return 0;
     }
@@ -3905,7 +3897,7 @@ static void gws_rewritten(gws_span *s) {   // the GPU writes a span again: a CPU
     }
 
     s->seen = now;
-    if (!gws_cpu_since(s, s->page_lo, s->page_hi)) {
+    if (!gws_cpu_since(s, s->lo, s->hi)) {
         return;
     }
 
@@ -3946,14 +3938,12 @@ static void gws_set(uintptr_t lo, uintptr_t hi) {   // [lo, hi) becomes one span
     memmove(g_gws + i + n, g_gws + j, (g_ngws - j) * sizeof *g_gws);
     g_ngws = g_ngws - (j - i) + n;
     if (nl) {
-        g_gws[i] = left;
-        gws_reprotect(&g_gws[i++]);
+        g_gws[i++] = left;
     }
     g_gws[i] = (gws_span){.lo = lo, .hi = hi};
     gws_stamp(&g_gws[i]);
     if (nr) {
         g_gws[i + 1] = right;
-        gws_reprotect(&g_gws[i + 1]);
     }
     atomic_store(&g_gws_new, 1);
 }
@@ -12948,6 +12938,16 @@ static int csh_cs(NvShader *cs, const p_dispatch *dp, csh_rng *w, int *nw, int *
 // Whether a dispatch comes before the first op that would stop cs_hoist_try's scan, looking at op codes only. Most passes have none: the scan then saved and restored the
 // whole replay state (S, R) and marked every argument table dirty at each pass's first draw for nothing (BotW: 2.5% of the submit thread in those copies alone).
 // Ops it cannot rule out (draws whose reads may stop the full scan) count as passable, so a 1 here only means the full scan may move something
+// A render-target switch to the targets the pass already has, which replay continues the pass across (same-target continuation, rtc_on): a scan goes past it. Ocarina of
+// Time sets its 1440x810 scene targets again before each group of compute work between its draws, and nearly every scan stopped there (op 8 about 27,000 times per 300 frames),
+// so the dispatches after it split the pass each time (about 9 MB of colour and depth stored and loaded again per split). A switch replay would not continue (other targets, the
+// continuation off, a deferred pass's start) stops the scan as before
+static int csh_rt_same(const uint8_t *q, const void *aq) {
+    const p_set_rt *r = aq;
+    for (int i = 0; i < 4; i++) if (g_defer_slots[i].active && !g_defer_slots[i].at_q && g_defer_slots[i].q_op == q) return 0;
+    return R.has_rt && rtc_on() && r->n && rt_same(&R.rt, r);
+}
+static uint64_t g_csh_rt;   // render-target switches to the same targets the scans went past
 static int csh_dispatch_ahead(void) {
     fz_cursor cur = {.p = g_exec_next}; for (int k = 0; k < g_ret_n; k++) cur.ret[cur.ret_n++] = g_ret[k];
     for (int guard = 0; guard < 4096; guard++) {
@@ -12956,6 +12956,7 @@ static int csh_dispatch_ahead(void) {
         switch (hq.op) {
             case OP_DISPATCH: return 1;
             case OP_BARRIER: { uint32_t bits; memcpy(&bits, aq, sizeof bits); if (bits) return 0; continue; }
+            case OP_SET_RT: if (csh_rt_same(q, aq)) continue; return 0;
             case OP_DRAW: case OP_DRAW_IDX:
             case OP_ALPHA_REF: case OP_BIND_IMG: case OP_BIND_PROGRAM: case OP_BIND_SAMP: case OP_BIND_SSBO: case OP_BIND_STATE: case OP_BIND_TEX: case OP_BIND_TEX1:
             case OP_BIND_UBO: case OP_BIND_UBO_SMALL: case OP_BIND_VATTR: case OP_BIND_VBUF: case OP_BIND_VBUF1: case OP_BIND_VSTREAM: case OP_BLEND_COLOR: case OP_COPY_STRIDE:
@@ -12997,6 +12998,7 @@ static void cs_hoist_try(NvProg *pr0, const p_draw *dw0, const p_draw_idx *di0) 
             PD("H %llu dispatch %s moved ahead of the pass%s", g_stat_pass + 1, cs->key, depth ? " (samples the pass's depth, which no draw before it wrote)" : "");
             dispatch(dp); g_csh_op[g_csh_n++] = q; g_csh_moved++; g_csh_depth += depth; moved++;
             continue; }
+        if (hq.op == OP_SET_RT && csh_rt_same(q, aq)) { g_csh_rt++; continue; }
         if (hq.op == OP_TF_STATE) { g_csh_stop[5]++; break; }   // saves/restores counters in GPU memory
         if (state_op(hq.op, aq)) continue;
         g_csh_stop[5]++; break;   // anything else may end the pass, write memory or depend on the order (copies, updates, clears, targets, queries)
@@ -13659,7 +13661,9 @@ void mtl_read_texels(const tex_t *t, unsigned level, unsigned layer0, const NVNc
     // make an unresolved one a private texture the CPU's later writes never reach, and an uploaded one whose pages changed would be uploaded on this thread (up_owner_check). One the
     // GPU may render or store into counts while it is CPU-written, or before its first use while the GPU has not written its storage; once resolved as a GPU texture (cpu_unc_drop, or
     // the GPU wrote first) it is read back from that
-    int lin_cpu = (linear_gpu_may_write(t) ? tex_cpu_written(t->serial) || (!tex_get(t->serial) && linear_storage_ok(t)) : linear_storage_ok(t))
+    // IMAGE permits GPU stores; it does not select a linear storage layout.
+    int lin_cpu = (t->d.flags & (NVN_TEXTURE_FLAGS_LINEAR | NVN_TEXTURE_FLAGS_LINEAR_RENDER_TARGET))
+                  && (linear_gpu_may_write(t) ? tex_cpu_written(t->serial) || (!tex_get(t->serial) && linear_storage_ok(t)) : linear_storage_ok(t))
                   && t->pool && !nvn_sparse_pool(t->pool) && t->d.target == NVN_TEXTURE_TARGET_2D && t->d.levels <= 1 && t->d.samples <= 1 && bw == 1 && bh == 1;
     if (lin_cpu) {
         size_t srow = t->L.layer_size / (t->d.height ? t->d.height : 1);
