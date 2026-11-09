@@ -36,8 +36,7 @@ static inline long dm_host_mem_cap_gb(void) {
         long gb = (long)(mem >> 30);
         if (gb >= 64) return gb - 16;   // 64 GB Mac -> 48 GB; 128 GB -> 112 GB
         if (gb >= 36) return gb - 8;    // 36-48 GB Mac -> 28-40 GB
-        if (gb >= 16) return gb - 4;    // 16-24 GB Mac -> 12-20 GB
-        return (gb * 3) / 4;
+        return 24;                      // 16-32 GB Mac: allow up to 24 GB working footprint with swap (prevents killing OoT at 12.4 GB)
     }
     return 24;
 }
