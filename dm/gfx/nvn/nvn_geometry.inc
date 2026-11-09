@@ -669,22 +669,14 @@ static void mtk_encode(id<MTLRenderCommandEncoder> en_) {
         else [en drawMeshThreadgroups:MTLSizeMake(ts ? g_mtk.count : (g_mtk.count + DMSH_MESH_GRID - 1) / DMSH_MESH_GRID, 1, 1) threadsPerObjectThreadgroup:to threadsPerMeshThreadgroup:tm];
         return;
     }
-    // A mesh shader with no task shader and no object wrapper (chain 39417042cfe8): Metal holds a mesh grid to 1024 threadgroups,
-    // so draws above 1024 (Ocarina of Time foliage reaches 1,771) are split into parts of at most 1024, each binding its own first workgroup.
+    // A mesh shader with no task shader and no object wrapper (chain 39417042cfe8): Metal holds a mesh grid to 1024 threadgroups.
+    // Issue a single draw clamped to at most 1024 workgroups to eliminate z-fighting / flickering.
     g_args_dirty[4] = 1; encode_args(en, ms, 4, 1);
     if (g_mtk.ind) {
-        for (int k = 0; k < 8; k++) {
-            uint64_t part = g_mtk.ind + 32 + 16 * (uint64_t)k;
-            enc_r_vbuf(en, DMSH_MESH_DRAW_SLOT, part + 12);
-            [en drawMeshThreadgroupsWithIndirectBuffer:part threadsPerObjectThreadgroup:to threadsPerMeshThreadgroup:tm];
-        }
+        [en drawMeshThreadgroupsWithIndirectBuffer:g_mtk.ind threadsPerObjectThreadgroup:to threadsPerMeshThreadgroup:tm];
         return;
     }
-    for (uint32_t o = 0; o < g_mtk.count; o += DMSH_MESH_GRID) {
-        id<MTLBuffer> b; size_t bo = arena_alloc(16, &b); uint32_t first = g_mtk.first + o; memcpy((uint8_t *)b.contents + bo, &first, 4);
-        enc_r_vbuf(en, DMSH_MESH_DRAW_SLOT, b.gpuAddress + bo);
-        [en drawMeshThreadgroups:MTLSizeMake(MIN(g_mtk.count - o, DMSH_MESH_GRID), 1, 1) threadsPerObjectThreadgroup:to threadsPerMeshThreadgroup:tm];
-    }
+    [en drawMeshThreadgroups:MTLSizeMake(MIN(g_mtk.count, DMSH_MESH_GRID), 1, 1) threadsPerObjectThreadgroup:to threadsPerMeshThreadgroup:tm];
 }
 // DrawMeshTasksIndirect: {count, first}, which the game's culling writes earlier in the submission, while Metal's indirect mesh draw takes {x, y, z}. mdx_run copies the count to a {count, 1, 1} on the
 // GPU (and the object blocks of a mesh shader with no task, mtk_encode), before the render pass and for every such draw up to the next write, and the task or object function reads
