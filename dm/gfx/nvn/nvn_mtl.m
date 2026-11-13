@@ -8934,6 +8934,18 @@ static int arch_file_ok(NSString *path) {
     struct stat st; int ok = !fstat(fd, &st) && S_ISREG(st.st_mode) && st.st_size > 0 && arch_container_ok(fd, (uint64_t)st.st_size);
     close(fd); return ok;
 }
+// A bundled archive read once, front to back in 8 MB blocks, before Metal opens it: Metal's archive reader maps the file and faults it in a page at a time, which a drive with a
+// latency of its own serves far slower than one sequential read. Ocarina of Time's 4.6 GB archive on a USB SSD (M1 Pro): opened in 33.0 s, 140 MB/s; the same drive reads 984 MB/s
+// in large sequential blocks and 173 MB/s a 16 KB page at a time. The file is then in the page cache when Metal faults it. DM_PSO_PREFETCH=0 leaves it to Metal. Returns its ms
+static double arch_prefetch(NSString *path) {
+    static int on = -1; if (on < 0) { const char *e = getenv("DM_PSO_PREFETCH"); on = !(e && !strcmp(e, "0")); }
+    if (!on) return 0;
+    int fd = open(path.fileSystemRepresentation, O_RDONLY); if (fd < 0) return 0;
+    uint64_t t0 = bp_now(); enum { CHUNK = 8 << 20 }; char *buf = malloc(CHUNK);
+    if (buf) while (read(fd, buf, CHUNK) > 0) {}
+    free(buf); close(fd);
+    return (bp_now() - t0) / 1e6;
+}
 static void pso_bundle_open(NSMutableArray<id<MTL4Archive>> *archp) {
     const char *e = getenv("DM_PSO_BUNDLE");
     if (!e || !*e || !strcmp(e, "off")) return;
@@ -8947,11 +8959,12 @@ static void pso_bundle_open(NSMutableArray<id<MTL4Archive>> *archp) {
     }
     uint64_t t0 = bp_now(); NSError *ae = nil;
     if (!arch_file_ok(p)) { MLOG("[RED] pipeline archive bundled with the app: %s is not a pipeline archive: the bases are built on the device", p.UTF8String); return; }
+    double pre = arch_prefetch(p);
     id<MTL4Archive> a = [g_dev newArchiveWithURL:[NSURL fileURLWithPath:p] error:&ae];
     if (!a) { MLOG("pipeline archive bundled with the app: this system cannot open %s (%s; made for another system version, or an OS update changed the GPU compiler): the bases are built on the device",
                    p.UTF8String, ae.localizedDescription.UTF8String); return; }
     g_arch_bundle = a; g_bundle_dir = dir; [archp addObject:a];
-    MLOG("pipeline archive bundled with the app: %s, %.1f MB, opened in %.1f ms", p.UTF8String, [[NSFileManager.defaultManager attributesOfItemAtPath:p error:nil] fileSize] / 1048576.0, (bp_now() - t0) / 1e6);
+    MLOG("pipeline archive bundled with the app: %s, %.1f MB, opened in %.1f ms (%.1f ms of it read ahead, DM_PSO_PREFETCH)", p.UTF8String, [[NSFileManager.defaultManager attributesOfItemAtPath:p error:nil] fileSize] / 1048576.0, (bp_now() - t0) / 1e6, pre);
 }
 // The prewarm files of the bundle (see g_prewarm_files). A file with a complete index is known to g_arch_ix by its keys; one without goes first among the files of bases with a vertex
 // layout. A file that is not an archive, or that this system cannot open, is left out with a line in the log: its bases are built on the device as before. Call between
@@ -8977,6 +8990,7 @@ static void pso_bundle_open_prewarm(NSMutableArray<id<MTL4Archive>> *arch) {
     uint64_t t0 = bp_now(); unsigned long long bytes = 0; NSUInteger n = 0, nidx = 0, nkeys = 0, nplain = 0; g_prewarm_open = [NSMutableArray array];
     for (NSString *name in names) {
         NSString *p = [dir stringByAppendingPathComponent:name]; NSError *ae = nil;
+        if (arch_file_ok(p)) arch_prefetch(p);
         id<MTL4Archive> a = arch_file_ok(p) ? [g_dev newArchiveWithURL:[NSURL fileURLWithPath:p] error:&ae] : nil;
         if (!a) { MLOG("[RED] prewarm archive bundled with the app: %s not usable (%s): its bases are built on the device", p.UTF8String, ae ? ae.localizedDescription.UTF8String : "not a pipeline archive"); continue; }
         int complete = 0; NSData *keys = arch_keys_read(arch_keys_path(p), &complete);
