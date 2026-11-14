@@ -164,6 +164,41 @@ def sign(app, identity, codesign):   # the inner host first, then the bundle (it
     strip_detritus(app)   # codesign sets an attribute on what it signs, which is a "._name" file again on exFAT: the signature still verifies without it, and a later --force would refuse it
 
 
+# Data bundles: the game's large files, RomFS (24 GB for Ocarina of Time), shader libraries, pipeline archive and DLC, each in a code bundle of its own in Contents/PlugIns
+# (<name>.bundle, an empty stub as its executable), with a symbolic link at their usual place in Contents/Resources, so the launcher and the host read the same paths. The app's
+# signature seals a nested bundle by its code directory hash alone and does not read its files again, so a pack that changes only the host (the usual one) signs in about a second
+# instead of reading every byte of the game again: on a USB SSD codesign read 38 GB at about 80 MB/s, 7-8 minutes a pack. A bundle whose inputs are those of the bundle in the app
+# being replaced (DMDataKey in its Info.plist) is cloned from it with its signature; one whose inputs changed is filled and signed anew. --flat keeps the files in Resources as before
+DATA = (('romfs', 'GameData'), ('msl', 'ShaderLibraries'), ('pso', 'PipelineArchive'), ('aoc', 'AddOnContent'))
+DATA_FORMAT = 'nxnative data bundle 1'
+STUB_C = 'int main(void) { return 0; }\n'   # a data bundle's executable: what makes codesign seal the bundle as nested code, by its hash, and not as resources
+
+
+def data_bundle(contents, name): return contents / 'PlugIns' / f'{name}.bundle'
+
+
+def data_reused(old_app, name, key, dst):
+    """Clone the bundle of the app being replaced when it holds these inputs (its DMDataKey) and is signed → True"""
+    if not old_app: return False
+    b = data_bundle(old_app / 'Contents', name)
+    try: info = plistlib.loads((b / 'Contents/Info.plist').read_bytes())
+    except (OSError, ValueError): return False
+    if info.get('DMDataKey') != key or not (b / 'Contents/_CodeSignature/CodeResources').is_file() or not (b / 'Contents/MacOS' / name).is_file(): return False
+    dst.parent.mkdir(parents=True, exist_ok=True)
+    copy([b], dst, can_clone(b / 'Contents/Info.plist', dst.parent))
+    return True
+
+
+def data_shell(dst, name, key, bundle_id, minos, clang, sdk):
+    """An empty data bundle at dst: its stub executable and Info.plist (with DMDataKey); the files go into dst/Contents/Resources"""
+    (dst / 'Contents/MacOS').mkdir(parents=True); (dst / 'Contents/Resources').mkdir()
+    with tempfile.TemporaryDirectory(dir=dst.parent) as t:
+        src = Path(t) / 'stub.c'; src.write_text(STUB_C)
+        run([clang, '-isysroot', sdk, '-arch', 'arm64', f'-mmacosx-version-min={minos}', '-O2', '-o', dst / 'Contents/MacOS' / name, src])
+    (dst / 'Contents/Info.plist').write_bytes(plistlib.dumps({'CFBundleIdentifier': f'{bundle_id}.data.{name.lower()}', 'CFBundleName': name, 'CFBundleExecutable': name,
+        'CFBundlePackageType': 'BNDL', 'CFBundleInfoDictionaryVersion': '6.0', 'LSMinimumSystemVersion': minos, 'DMDataKey': key}))
+
+
 def digest(path):
     h = hashlib.sha256()
     with Path(path).open('rb') as f:
@@ -323,10 +358,28 @@ def pack(a):
     if fonts: copy(fonts, dm / 'font', False)
     if a.env_file: shutil.copyfile(a.env_file, dm / 'env.txt')
     if a.settings: shutil.copyfile(a.settings, dm / 'launcher.json')
-    step('shader libraries'); msl_dst = res / 'msl' / (a.msl_name or msl.name); msl_dst.parent.mkdir(exist_ok=True); copy_msl(msl, msls, msl_dst, clone['msl'])
-    if aoc: step('add-on content'); copy([aoc], res / 'aoc', clone['aoc'])
-    if pso: step('pipeline archive'); (res / 'pso').mkdir(); copy(pso, res / 'pso', clone['pso'])
-    step('game files'); copy([romfs], res / ('romfs.img' if romfs.is_file() else 'romfs'), clone['romfs'])
+    msl_dst = res / 'msl' / (a.msl_name or msl.name)
+    bundles = not a.flat and not programs   # a game of several programs keeps its files in Resources (its programs' libraries go into msl/p<N>)
+    old_app = out if out.is_dir() else None
+    common = [DATA_FORMAT, a.sign, digest(codesign), minos, a.bundle_id or a.title_id]
+    data_inputs = {'romfs': lambda: inventory(romfs), 'aoc': lambda: inventory(aoc),
+                   'msl': lambda: [a.msl_name or msl.name, digest(Path(shader_lib.__file__)), [(str(p), p.stat().st_size, p.stat().st_mtime_ns, p.stat().st_ctime_ns) for p in msl_inputs(msl)]],
+                   'pso': lambda: [(str(p), inventory(p)) for p in pso]}
+    fresh = []   # the data bundles filled in this pack, signed below
+    def place(item, top, label, fill):   # one item's files: into its data bundle (made, or cloned from the old app), linked at Resources/<top>; or into Resources (--flat)
+        if not bundles: step(label); fill(res); return
+        name = dict(DATA)[item]; b = data_bundle(c, name)
+        key = hashlib.sha256(json.dumps(common + [item, data_inputs[item]()], sort_keys=True).encode()).hexdigest()
+        if data_reused(old_app, name, key, b): step(f'{label} (reused, signed)')
+        else:
+            step(label); data_shell(b, name, key, a.bundle_id or f'org.nxnative.{a.title_id.lower()}', minos, clang, sdk); fill(b / 'Contents/Resources'); fresh.append(b)
+        (res / top).symlink_to(Path('..') / 'PlugIns' / b.name / 'Contents/Resources' / top)
+    def fill_msl(root): d = root / 'msl' / msl_dst.name; d.parent.mkdir(exist_ok=True); copy_msl(msl, msls, d, clone['msl'])
+    place('msl', 'msl', 'shader libraries', fill_msl)
+    if aoc: place('aoc', 'aoc', 'add-on content', lambda root: copy([aoc], root / 'aoc', clone['aoc']))
+    if pso: place('pso', 'pso', 'pipeline archive', lambda root: ((root / 'pso').mkdir(), copy(pso, root / 'pso', clone['pso'])))
+    rtop = 'romfs.img' if romfs.is_file() else 'romfs'
+    place('romfs', rtop, 'game files', lambda root: copy([romfs], root / rtop, clone['romfs']))
     if a.html and Path(a.html).is_dir(): copy([Path(a.html)], res / 'html', False)   # the offline pages, beside the RomFS where the host looks for them (hle_web.c)
     # The other programs: p<N>/ (RomFS, offline pages), msl/p<N>/<library>, dm/p<N>/ (modules, tables), and the table of them all, which the launcher makes DM_PROGRAMS (launcher.c, hle_oe.c): @R@ Resources, @C@ Contents, @S@ the app's Application Support folder
     if programs:
@@ -349,7 +402,9 @@ def pack(a):
     if msl_dst.name.startswith('b-'): info['DMChain'] = msl_dst.name[2:]   # the library chain the app carries (a Vulkan or GL game's vk / gl has none)
     (c / 'Info.plist').write_bytes(plistlib.dumps(info))
     (c / 'PkgInfo').write_text('APPL????')
-    step(f'signing ({"ad-hoc" if a.sign == "-" else a.sign})'); sign(tmp, a.sign, codesign)
+    step(f'signing ({"ad-hoc" if a.sign == "-" else a.sign})')
+    for b in fresh: strip_detritus(b); run([codesign, '--force', '--sign', a.sign, b])   # a new data bundle, read whole once; the app's signature then takes its hash
+    sign(tmp, a.sign, codesign)
     had_old = out.exists()
     replace_app(tmp, out)
     key_tmp = key_file.with_name(key_file.name + '.partial')
@@ -387,6 +442,7 @@ def parse(argv):
     ap.add_argument('--version'); ap.add_argument('--bundle-id'); ap.add_argument('--category'); ap.add_argument('--lang'); ap.add_argument('--marker', help='the profile\'s romfs_marker')
     ap.add_argument('--icon', help='the game icon (icon.jpg from the control data)')
     ap.add_argument('--sign', default='-', help='codesign identity (default: - = ad-hoc)')
+    ap.add_argument('--flat', action='store_true', help='keep the game\'s large files in Contents/Resources, without the data bundles (a pack signs them all again)')
     return ap.parse_args(argv)
 
 

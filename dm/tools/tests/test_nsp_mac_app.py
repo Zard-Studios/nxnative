@@ -618,11 +618,24 @@ class App(unittest.TestCase):
     def test_missing_data(self):
         broken = self.tmp / 'Broken.app'; shutil.rmtree(broken, ignore_errors=True)
         subprocess.run(['/bin/cp', '-R', self.app, broken], check=True)
-        shutil.rmtree(broken / 'Contents/Resources/romfs')
+        r = broken / 'Contents/Resources/romfs'
+        shutil.rmtree(r.resolve() if r.is_symlink() else r)   # the data itself: in its data bundle, behind the link
         (self.tmp / 'home/alert.txt').unlink(missing_ok=True)
         p = subprocess.run([broken / 'Contents/MacOS/nxnative'], env=dict(HOME=str(self.tmp / 'home'), PATH=f'{self.tmp / "bin"}:/usr/bin:/bin'), capture_output=True, text=True, timeout=30)
         self.assertEqual(p.returncode, 1)
         self.assertIn('game data inside this app is missing', (self.tmp / 'home/alert.txt').read_text())
+
+    def test_data_bundles(self):
+        # the game's files sit in signed nested bundles (Contents/PlugIns/<name>.bundle) behind links in Resources, and the app's signature holds them by hash
+        r = Path(self.app) / 'Contents/Resources/romfs'
+        self.assertTrue(r.is_symlink())
+        self.assertEqual(r.resolve(), (Path(self.app) / 'Contents/PlugIns/GameData.bundle/Contents/Resources/romfs').resolve())
+        info = plistlib.loads((Path(self.app) / 'Contents/PlugIns/GameData.bundle/Contents/Info.plist').read_bytes())
+        self.assertEqual(len(info['DMDataKey']), 64)
+        subprocess.run(['codesign', '--verify', '--strict', self.app], check=True, capture_output=True)
+        seal = plistlib.loads((Path(self.app) / 'Contents/_CodeSignature/CodeResources').read_bytes())['files2']
+        self.assertIn('cdhash', seal['PlugIns/GameData.bundle'])
+        self.assertFalse(any(k.startswith('PlugIns/GameData.bundle/') for k in seal))
 
     def test_missing_modules(self):
         for missing in (('main.patched.bin',), ('main.fixups.tsv',), ('main.patched.bin', 'main.fixups.tsv')):
